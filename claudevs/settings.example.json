@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/src/cli-agent-surgery/claudevs/hooks/state-guard"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/src/cli-agent-surgery/claudevs/hooks/state-guard"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/src/cli-agent-surgery/claudevs/hooks/state-guard"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Records the payload and firing order of the compaction hook chain, and
+# proves whether SessionStart(compact) context injection reaches the model.
+# Never blocks a session: always exits 0.
+#
+# Log:       ~/.local/state/claudevs/compact-probe.jsonl
+# Summaries: ~/.local/state/claudevs/summaries/<sid>-<ns>.md
+set -u
+
+STATE="${CLAUDEVS_STATE:-$HOME/.local/state/claudevs}"
+LOG="$STATE/compact-probe.jsonl"
+SUMDIR="$STATE/summaries"
+mkdir -p "$STATE" "$SUMDIR"
+
+payload="$(cat 2>/dev/null || true)"
+ns="$(date +%s%N)"
+at="$(date -Is)"
+
+if ! jq -e . >/dev/null 2>&1 <<<"$payload"; then
+  printf '{"at":"%s","ns":"%s","event":"?","unparsed":true}\n' "$at" "$ns" >> "$LOG"
+  exit 0
+fi
+
+event="$(jq -r '.hook_event_name // "?"' <<<"$payload")"
+sid="$(jq -r '.session_id // "?"' <<<"$payload")"
+source="$(jq -r '.source // ""' <<<"$payload")"
+trigger="$(jq -r '.trigger // ""' <<<"$payload")"
+summary="$(jq -r '.compact_summary // ""' <<<"$payload")"
+
+# compact_summary can be tens of KiB — keep the log line small and put the
+# text in its own file, addressable from the log entry.
+sumfile=""
+if [[ -n "$summary" ]]; then
+  sumfile="$SUMDIR/$sid-$ns.md"
+  printf '%s' "$summary" > "$sumfile"
+fi
+
+jq -c -n \
+  --arg at "$at" --arg ns "$ns" --arg ev "$event" --arg sid "$sid" \
+  --arg src "$source" --arg trg "$trigger" --arg sf "$sumfile" \
+  --argjson slen "${#summary}" \
+  --argjson keys "$(jq -c '[keys[]]' <<<"$payload")" \
+  '{at:$at, ns:$ns, event:$ev, session_id:$sid, source:$src, trigger:$trg,
+    summary_chars:$slen, summary_file:$sf, payload_keys:$keys}' >> "$LOG"
+
+# Only SessionStart carries context back into the conversation; the marker
+# tells us in-session whether the injection landed and at which point.
+if [[ "$event" == "SessionStart" ]]; then
+  jq -c -n --arg ctx "claudevs probe: SessionStart(source=$source) injection landed, ns=$ns" \
+    '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$ctx}}'
+fi
+exit 0

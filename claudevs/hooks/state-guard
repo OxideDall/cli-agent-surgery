@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec /usr/bin/env python3 "$(dirname "$(readlink -f "$0")")/state_guard.py"
