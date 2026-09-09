@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Attach a kitty viewer on workspace 4 to every tmux-held claudevs session and
+# merge them into one Hyprland tabbed group. Mirror of claudev-restore with a
+# separate registry, holder prefix (cvs-) and window class, so the two forks
+# never adopt each other's sessions.
+#
+# Not wired into Hyprland exec-once on purpose: claudevs is the experiment
+# branch and must be started by hand, never on login.
+set -u
+
+CLASS=claudevs-session
+WS=4
+STATE="$HOME/.local/state/claudevs"
+REG="$STATE/sessions"
+CLAUDEV_REG="$HOME/.local/state/claudev/sessions"
+
+mkdir -p "$STATE" "$REG"
+RESTORE_LOG="$STATE/restore.log"
+log() {
+  printf '%s claudevs-restore: %s\n' "$(date '+%F %T')" "$*" | tee -a "$RESTORE_LOG" >&2
+}
+log "запуск (pid $$)"
+
+command -v hyprctl >/dev/null || { log "нет hyprctl — нечего делать"; exit 0; }
+[[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || { log "Hyprland не запущен"; exit 0; }
+
+# A sid re-launched under plain claudev belongs to claudev-restore again.
+prune_reclaimed() {
+  local sid
+  for sid in $(/bin/ls -1 "$REG" 2>/dev/null); do
+    if [[ -f "$CLAUDEV_REG/$sid" ]]; then
+      rm -f "$REG/$sid"
+      log "$sid вернулся под claudev — запись убрана"
+    fi
+  done
+}
+
+registry_sids() { /bin/ls -1 "$REG" 2>/dev/null; }
+holders() { tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^cvs-' | sort; }
+attached() { tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null \
+             | awk '$2>0{print $1}'; }
+
+spawn_holder() {
+  local sid="$1" name="cvs-${1:0:8}" cwd mode att
+  tmux has-session -t "=$name" 2>/dev/null && return 0
+  # Already running outside tmux (hand-opened terminal, or a claudev holder):
+  # the duplicate guard would kill the new window on sight. Leave it alone.
+  if pgrep -f -- "--(resume|session-id)[= ]$sid" >/dev/null 2>&1; then
+    log "$sid уже запущен вне tmux — холдер не поднимаю"
+    return 0
+  fi
+  cwd="$(sed -n 1p "$REG/$sid" 2>/dev/null)"
+  mode="$(sed -n 2p "$REG/$sid" 2>/dev/null)"
+  [[ -d "$cwd" ]] || cwd="$HOME"
+  [[ "$mode" == "claude" ]] && att=--attach-plain || att=--attach
+  local err
+  if ! err="$(tmux new-session -d -s "$name" -c "$cwd" \
+                bash -lc "exec '$HOME/.local/bin/claudevs' $att '$sid'" 2>&1)"; then
+    [[ "$err" == *"duplicate session"* ]] && return 0
+    log "не поднялся холдер $name: $err"
+    return 1
+  fi
+  tmux set-option -t "$name" status off
+  tmux set-option -t "$name" destroy-unattached off
+  tmux set-option -t "$name" @claudevs_sid "$sid"
+  tmux set-option -t "$name" @claudevs_cwd "$cwd"
+  log "поднят холдер $name"
+}
+
+prune_reclaimed
+while read -r sid; do
+  [[ -n "$sid" ]] && spawn_holder "$sid"
+done < <(registry_sids)
+
+mapfile -t names < <(holders)
+(( ${#names[@]} )) || { log "холдеров нет и реестр пуст — нечего восстанавливать"; exit 0; }
+
+viewers() { hyprctl -j clients | jq -r --arg c "$CLASS" '.[]|select(.class==$c)|.address'; }
+
+hyprctl dispatch workspace "$WS" >/dev/null
+
+anchor="$(hyprctl -j clients | jq -r --arg c "$CLASS" '[.[]|select(.class==$c)][0].address // empty')"
+mapfile -t busy < <(attached)
+opened=0 skipped=0
+
+for name in "${names[@]}"; do
+  if printf '%s\n' "${busy[@]}" | grep -qFx "$name"; then
+    log "$name уже открыт"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  cwd="$(tmux show-option -qv -t "$name" @claudevs_cwd)"
+  [[ -d "$cwd" ]] || cwd="$HOME"
+
+  [[ -n "$anchor" ]] && hyprctl dispatch focuswindow "address:$anchor" >/dev/null
+
+  before="$(viewers | sort)"
+  hyprctl dispatch exec "[workspace $WS] kitty --class $CLASS --title '[$name]' --directory '$cwd' --override scrollback_lines=50000 --override confirm_os_window_close=0 tmux attach-session -t '=$name'" >/dev/null
+
+  new=""
+  for _ in $(seq 1 150); do   # cold kitty start takes seconds
+    sleep 0.1
+    new="$(comm -13 <(printf '%s\n' "$before") <(viewers | sort) | head -1)"
+    [[ -n "$new" ]] && break
+  done
+  if [[ -z "$new" ]]; then
+    log "окно для $name не появилось"
+    continue
+  fi
+  opened=$((opened + 1))
+
+  if [[ -z "$anchor" ]]; then
+    anchor="$new"
+    hyprctl dispatch focuswindow "address:$anchor" >/dev/null
+    hyprctl dispatch togglegroup >/dev/null
+  fi
+done
+
+date -Is > "$STATE/last-restore"
+log "открыто $opened, пропущено $skipped, холдеров ${#names[@]}"
