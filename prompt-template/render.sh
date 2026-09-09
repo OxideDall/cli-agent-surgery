@@ -52,9 +52,47 @@ esac
 
 OS_VERSION=$(uname -sr)
 
-MODEL_NAME="${TUNE_MODEL_NAME:-unknown}"
-MODEL_ID="${TUNE_MODEL_ID:-unknown}"
-CUTOFF="${TUNE_CUTOFF:-unknown}"
+# Model id: env → optional settings JSON (TUNE_MODEL_SETTINGS + TUNE_MODEL_KEY)
+# → unknown. Agents often store a short alias ("opus", "opus[1m]") rather than a
+# full id; both are normalized here, and a stale guess is never substituted.
+MODEL_ID="${TUNE_MODEL_ID:-}"
+if [[ -z "$MODEL_ID" && -n "${TUNE_MODEL_SETTINGS:-}" ]] && command -v jq >/dev/null; then
+  MODEL_ID=$(jq -r --arg k "${TUNE_MODEL_KEY:-model}" '.[$k] // empty' \
+             "$TUNE_MODEL_SETTINGS" 2>/dev/null) || MODEL_ID=""
+fi
+CTX_NOTE=""
+[[ "$MODEL_ID" == *"[1m]"* ]] && CTX_NOTE=" (1M context)"
+MODEL_ID="${MODEL_ID%%\[*}"
+[[ -z "$MODEL_ID" ]] && MODEL_ID=unknown
+
+# "claude-fable-5" -> "Fable 5"; "opus" -> "Opus"; a trailing date is dropped.
+if [[ -n "${TUNE_MODEL_NAME:-}" ]]; then
+  MODEL_NAME="$TUNE_MODEL_NAME"
+else
+  rest="${MODEL_ID#claude-}"
+  fam="${rest%%-*}"
+  ver="${rest#"$fam"}"; ver="${ver#-}"
+  ver="$(printf '%s' "$ver" | sed -E 's/-?[0-9]{8}$//; s/-/./g')"
+  MODEL_NAME="${fam^}${ver:+ $ver}${CTX_NOTE}"
+fi
+
+# Knowledge cutoffs for Anthropic ids, from the platform models overview.
+# Anything unrecognised stays "unknown" rather than inheriting a neighbour's date.
+if [[ -n "${TUNE_CUTOFF:-}" ]]; then
+  CUTOFF="$TUNE_CUTOFF"
+else
+  case "$MODEL_ID" in
+    *fable-5*|*mythos-5*)  CUTOFF="Jan 2026" ;;
+    *opus-5*)              CUTOFF="May 2026" ;;
+    *opus-4-8*|*opus-4-7*) CUTOFF="Jan 2026" ;;
+    *opus-4-6*|*opus-4-5*) CUTOFF="May 2025" ;;
+    *sonnet-5*)            CUTOFF="Jan 2026" ;;
+    *sonnet-4-6*)          CUTOFF="Aug 2025" ;;
+    *sonnet-4-5*)          CUTOFF="Jan 2025" ;;
+    *haiku-4-5*)           CUTOFF="Feb 2025" ;;
+    *)                     CUTOFF="unknown" ;;
+  esac
+fi
 
 # MEMORY_DIR: default under XDG cache, keyed by cwd
 default_mem_key=$(printf '%s' "$CWD" | sed 's|^/||' | tr '/' '-')

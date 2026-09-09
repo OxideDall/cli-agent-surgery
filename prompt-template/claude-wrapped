@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# claude-wrapped — tuned Claude Code launcher.
+# Renders the system prompt template from env, then execs the real `claude`
+# with --system-prompt-file. Passes through all user arguments.
+#
+# Usage:
+#   - Direct CLI:   ln -s $(pwd)/claude-wrapped ~/.local/bin/claude  (or run directly)
+#   - VS Code:      Settings → "claudeCode.claudeProcessWrapper": "/abs/path/claude-wrapped"
+#
+# Env overrides (all optional):
+#   TUNE_TEMPLATE        — template path (default: ./system_prompt.md)
+#   TUNE_RENDERED        — output rendered-prompt path (default: .rendered_prompt.md)
+#   TUNE_REAL_CLAUDE     — absolute path to real claude binary
+#   TUNE_MEMORY_DIR      — memory dir (exported to CLAUDE_COWORK_MEMORY_PATH_OVERRIDE)
+#   TUNE_* (see render.sh for the rest)
+set -euo pipefail
+
+BASE_DIR="$(dirname "$(readlink -f "$0")")"
+TEMPLATE="${TUNE_TEMPLATE:-$BASE_DIR/system_prompt.md}"
+# Per-process path: parallel launches (claudev --restore spawns many per second)
+# raced on one shared file, handing sessions each other's CWD/IS_GIT.
+RENDERED="${TUNE_RENDERED:-${XDG_RUNTIME_DIR:-/tmp}/cli-agent-surgery/rendered-$$.md}"
+mkdir -p "$(dirname "$RENDERED")"
+
+# Render fresh every launch — CWD/IS_GIT change per invocation.
+"$BASE_DIR/render.sh" "$TEMPLATE" > "$RENDERED"
+
+# Locate real claude binary. Skip anything inside BASE_DIR so we don't self-loop.
+# Search order: env override → PATH → common bin dirs → VS Code extension bundle.
+# PATH first so the user's npm-global/nvm install (usually freshest) wins.
+# Extension bundle is fallback for VS Code's claudeProcessWrapper context, where
+# the child env has a stripped PATH and may not see ~/.local/bin or nvm.
+if [[ -n "${TUNE_REAL_CLAUDE:-}" ]]; then
+  CLAUDE_BIN="$TUNE_REAL_CLAUDE"
+else
+  CLAUDE_BIN=""
+
+  # 1. PATH lookup (skip self)
+  IFS=: read -ra _PATH <<<"${PATH:-}"
+  for p in "${_PATH[@]}"; do
+    cand="$p/claude"
+    if [[ -x "$cand" && "$cand" != "$BASE_DIR/"* ]]; then
+      CLAUDE_BIN="$cand"
+      break
+    fi
+  done
+
+  # 2. Common bin dirs (VS Code env may miss them)
+  if [[ -z "$CLAUDE_BIN" ]]; then
+    for cand in "$HOME/.local/bin/claude" /usr/local/bin/claude /usr/bin/claude \
+                "$HOME/.bun/install/global/bin/claude" "$HOME/.npm-global/bin/claude"; do
+      if [[ -x "$cand" ]]; then
+        CLAUDE_BIN="$cand"
+        break
+      fi
+    done
+  fi
+
+  # 3. VS Code / Cursor extension bundle (last-resort fallback).
+  # Loop without `break` so the lexicographically-last (≈newest) extension wins.
+  if [[ -z "$CLAUDE_BIN" ]]; then
+    for ext in "$HOME/.vscode/extensions/anthropic.claude-code-"*"-linux-x64" \
+               "$HOME/.vscode-oss/extensions/anthropic.claude-code-"*"-linux-x64" \
+               "$HOME/.cursor/extensions/anthropic.claude-code-"*"-linux-x64"; do
+      cand="$ext/resources/native-binary/claude"
+      if [[ -x "$cand" ]]; then
+        CLAUDE_BIN="$cand"
+      fi
+    done
+  fi
+fi
+
+if [[ -z "$CLAUDE_BIN" ]]; then
+  printf 'claude-wrapped: real `claude` not found — set TUNE_REAL_CLAUDE\n' >&2
+  exit 127
+fi
+
+# Drift guard: the template replaces the stock system prompt, which evolves with
+# the binary. Warn once per binary change so the template gets re-reviewed.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cli-agent-surgery"
+_real_bin="$(readlink -f "$CLAUDE_BIN")"
+_cur="$_real_bin $(stat -c '%s %Y' "$_real_bin" 2>/dev/null)"
+if [[ "$(cat "$STATE_DIR/binary-stamp" 2>/dev/null)" != "$_cur" ]]; then
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$_cur" > "$STATE_DIR/binary-stamp"
+  _msg="claude binary changed ($_real_bin) — re-review system_prompt.md vs new stock toolset"
+  printf 'claude-wrapped: %s\n' "$_msg" >&2
+  command -v notify-send >/dev/null 2>&1 && notify-send -u normal cli-agent-surgery "$_msg" 2>/dev/null || true
+fi
+
+# Enable auto-memory under custom system prompt (QueryEngine checks this env var).
+if [[ -z "${CLAUDE_COWORK_MEMORY_PATH_OVERRIDE:-}" ]]; then
+  if [[ -n "${TUNE_MEMORY_DIR:-}" ]]; then
+    export CLAUDE_COWORK_MEMORY_PATH_OVERRIDE="$TUNE_MEMORY_DIR"
+  else
+    _mem_key=$(printf '%s' "$PWD" | sed 's|^/||' | tr '/' '-')
+    export CLAUDE_COWORK_MEMORY_PATH_OVERRIDE="$HOME/.claude/projects/-$_mem_key/memory"
+  fi
+fi
+
+exec "$CLAUDE_BIN" --system-prompt-file "$RENDERED" "$@"

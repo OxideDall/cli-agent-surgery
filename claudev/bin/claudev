@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# claudev: claude-wrapped launcher with session persistence across reboots.
+# Registers session in ~/.local/state/claudev/sessions/<sid> (line1=cwd,
+# line2=mode). Record removed on user close (exit, double Ctrl+C, mod+q),
+# kept on reboot/system kill. `claudev --restore` respawns kept sessions.
+# CLAUDEV_LAUNCH_OVERRIDE replaces the launched binary (tests only).
+set -u
+
+REG="$HOME/.local/state/claudev/sessions"
+WRAPPED="${CLAUDEV_WRAPPED:-$HOME/projects/claude_tune/claude-wrapped}"
+FLAGS=(--dangerously-skip-permissions --allow-dangerously-skip-permissions --effort max)
+mkdir -p "$REG"
+
+# Newest session id of the current project, or empty. Tries both key schemes
+# (`_` kept / `_` -> `-`) — the encoding changed between claude versions.
+latest_sid() {
+  local key dir f
+  for key in "$(printf '%s' "$PWD" | sed 's|[/.]|-|g')" \
+             "$(printf '%s' "$PWD" | sed 's|[/._]|-|g')"; do
+    dir="$HOME/.claude/projects/$key"
+    [[ -d "$dir" ]] || continue
+    f=$(ls -1t "$dir"/*.jsonl 2>/dev/null | head -n1) || true
+    [[ -n "$f" ]] && { basename "$f" .jsonl; return 0; }
+  done
+  return 1
+}
+
+# Claude's /resume picker copies `cd <path> && claude --resume <sid>` for
+# sessions outside the cwd; the binary literal is rewritten to `claudev` so the
+# wrapper isn't dropped. Stat stamp keeps it to one scan per claude upgrade.
+ensure_resume_patch() {
+  local bin stamp size mtime sbin ssize smtime
+  bin="$(command -v claude 2>/dev/null)" || return 0
+  bin="$(readlink -f "$bin" 2>/dev/null)" || return 0
+  [[ -f "$bin" ]] || return 0
+  stamp="$HOME/.local/state/claudev/resume-patch"
+  IFS=$'\t' read -r size mtime < <(stat -c $'%s\t%Y' "$bin" 2>/dev/null) || return 0
+  IFS=$'\t' read -r sbin ssize smtime _ < "$stamp" 2>/dev/null || true
+  [[ "$sbin" == "$bin" && "$ssize" == "$size" && "$smtime" == "$mtime" ]] && return 0
+  "$HOME/.local/bin/claudev-patch-resume" "$bin" >/dev/null 2>&1 || true
+}
+ensure_resume_patch
+
+MODE=claudev
+case "${1:-}" in
+  --restore)
+    exec "$HOME/.local/bin/claudev-restore"
+    ;;
+  --attach)
+    SID="$2"; shift 2
+    RUN=("$WRAPPED" "${FLAGS[@]}" --resume "$SID" "$@")
+    ;;
+  --attach-plain)
+    # Session originally started as bare `claude`; resume it the same way.
+    MODE=claude
+    SID="$2"; shift 2
+    RUN=(claude --dangerously-skip-permissions --resume "$SID" "$@")
+    ;;
+  --resume|-r|--pick|-p)
+    shift
+    if [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; then
+      SID="$1"; shift
+      RUN=("$WRAPPED" "${FLAGS[@]}" --resume "$SID" "$@")
+    else
+      # Own picker: every project, full history, favourites — claude's built-in
+      # list is scoped to the cwd and truncated. It reports the pick via a file
+      # because the TUI owns stdout.
+      pickfile="$(mktemp -t claudev-pick.XXXXXX)"
+      trap 'rm -f "$pickfile"' EXIT
+      "$HOME/.local/bin/claudev-pick" --out "$pickfile" || true
+      SID="$(sed -n 1p "$pickfile" 2>/dev/null)"
+      PICKED_CWD="$(sed -n 2p "$pickfile" 2>/dev/null)"
+      rm -f "$pickfile"; trap - EXIT
+      [[ -n "$SID" ]] || { echo "claudev: сессия не выбрана" >&2; exit 0; }
+      [[ -d "${PICKED_CWD:-}" ]] && cd "$PICKED_CWD"
+      RUN=("$WRAPPED" "${FLAGS[@]}" --resume "$SID" "$@")
+    fi
+    ;;
+  --continue|-c)
+    shift
+    SID="$(latest_sid)" || { echo "claudev: no sessions to continue in $PWD" >&2; exit 1; }
+    RUN=("$WRAPPED" "${FLAGS[@]}" --resume "$SID" "$@")
+    ;;
+  *)
+    SID="$(uuidgen)"
+    RUN=("$WRAPPED" "${FLAGS[@]}" --session-id "$SID" "$@")
+    ;;
+esac
+
+[[ -n "${CLAUDEV_LAUNCH_OVERRIDE:-}" ]] && RUN=(sh -c "$CLAUDEV_LAUNCH_OVERRIDE")
+
+# Two claude processes on one session id append to the same transcript with
+# independent uuid/parentUuid chains, which tangles the conversation tree.
+# Refuse instead, and say where the running copy lives.
+assert_single() {
+  local sid="$1" pid others holder=""
+  others=()
+  for pid in $(pgrep -f -- "--(resume|session-id)[= ]$sid" 2>/dev/null); do
+    [[ "$pid" == "$$" ]] && continue
+    grep -qa 'claude' "/proc/$pid/cmdline" 2>/dev/null || continue
+    others+=("$pid")
+  done
+  (( ${#others[@]} )) || return 0
+
+  holder="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -Fx "cv-${sid:0:8}" || true)"
+  {
+    echo "claudev: сессия $sid уже запущена (pid ${others[*]})."
+    if [[ -n "$holder" ]]; then
+      echo "         подключись к живой копии:  tmux attach -t $holder"
+    else
+      echo "         копия работает вне tmux — найди её окно или заверши процесс."
+    fi
+    echo "         список всех сессий:          claudev-pick"
+  } >&2
+  exit 1
+}
+[[ -n "${SID:-}" && -z "${CLAUDEV_ALLOW_DUPLICATE:-}" ]] && assert_single "$SID"
+
+REC=""
+if [[ -n "$SID" ]]; then
+  REC="$REG/$SID"
+  printf '%s\n%s\n' "$PWD" "$MODE" > "$REC"
+fi
+
+on_hup() {
+  # mod+q closes the terminal -> HUP. During shutdown HUP can race TERM:
+  # keep the record if the system is going down or the compositor is gone.
+  if [[ "$(systemctl is-system-running 2>/dev/null)" == "stopping" ]] \
+     || ! pgrep -x Hyprland >/dev/null 2>&1; then
+    exit 129
+  fi
+  [[ -n "$REC" ]] && rm -f "$REC"
+  exit 129
+}
+trap on_hup HUP
+trap 'exit 143' TERM   # reboot/system kill -> keep record
+trap '' INT            # Ctrl+C belongs to claude; it decides when to exit
+
+"${RUN[@]}"
+rc=$?
+[[ -n "$REC" ]] && rm -f "$REC"   # clean exit -> user closed it
+exit "$rc"

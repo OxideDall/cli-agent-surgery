@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Session picker TUI — console script from the project venv.
+exec "${CLAUDEV_TUI_BIN:-$HOME/projects/claudev/.venv/bin/claudev-pick}" "$@"

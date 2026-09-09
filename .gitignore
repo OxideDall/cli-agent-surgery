@@ -1,2 +1,5 @@
 .rendered_prompt.md
 *.tmp
+__pycache__/
+*.egg-info/
+.venv/

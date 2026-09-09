@@ -1,0 +1,10 @@
+[Unit]
+Description=Зеркалирование транскриптов Claude на удалённый хост
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claudev-backup
+Nice=10
+IOSchedulingClass=idle

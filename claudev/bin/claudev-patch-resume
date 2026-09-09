@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Patch the claude binary so the resume-picker clipboard command says `claudev`.
+
+Claude Code's /resume picker, when the chosen session lives in another project,
+copies `cd <path> && claude --resume <sid>` instead of resuming inline. That
+drops the claudev wrapper (session registry, tuned prompt), so the literal is
+rewritten in place to `claudev`. Byte length is preserved — bun standalone
+binaries embed module offsets, so the file size must not change.
+
+Usage: claudev-patch-resume [--check|--revert] [BINARY]
+"""
+from __future__ import annotations
+
+import enum
+import mmap
+import os
+import re
+import shutil
+import stat
+import sys
+import tempfile
+
+STAMP = os.path.expanduser("~/.local/state/claudev/resume-patch")
+
+# `let i=zS(e);return`cd ${Bd([e.projectPath])} ${uoi()} claude --resume ${i}``
+# Minified identifiers change every release, so match on structure: the `let`
+# binding is dropped and its bytes fund the extra `v` plus the inlined call.
+PLAIN = re.compile(
+    rb"let (?P<v>[\w$]+)=(?P<f>[\w$]+)\((?P<a>[\w$]+)\);"
+    rb"return`cd \$\{(?P<path>[^`{}]+)\} \$\{(?P<sep>[^`{}]+)\} claude --resume \$\{(?P=v)\}`"
+)
+PATCHED = re.compile(
+    rb"return(?P<pad> *)`cd \$\{(?P<path>[^`{}]+)\} \$\{(?P<sep>[^`{}]+)\}"
+    rb" claudev --resume \$\{(?P<call>[\w$]+\([\w$]+\))\}`"
+)
+
+
+class Status(str, enum.Enum):
+    PATCHED = "patched"
+    ALREADY = "already-patched"
+    REVERTED = "reverted"
+    NOT_PATCHED = "not-patched"
+    NO_MATCH = "no-match"
+
+
+class PatchError(RuntimeError):
+    pass
+
+
+def resolve_binary(argv_path: str | None) -> str:
+    for cand in (argv_path, os.environ.get("CLAUDE_TUNE_REAL_CLAUDE"), shutil.which("claude")):
+        if cand:
+            real = os.path.realpath(cand)
+            if os.path.isfile(real):
+                return real
+    raise PatchError("`claude` not found in PATH — pass the binary path explicitly")
+
+
+def read_head(path: str, n: int = 4) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read(n)
+
+
+def find_one(data: mmap.mmap, pattern: re.Pattern[bytes]) -> re.Match[bytes] | None:
+    hits = list(pattern.finditer(data))
+    if len(hits) > 1:
+        raise PatchError(f"{len(hits)} matches for {pattern.pattern!r} — refusing to guess")
+    return hits[0] if hits else None
+
+
+def build_patched(m: re.Match[bytes]) -> bytes:
+    tail = (
+        b"`cd ${" + m["path"] + b"} ${" + m["sep"] + b"} claudev --resume ${"
+        + m["f"] + b"(" + m["a"] + b")}`"
+    )
+    pad = len(m[0]) - len(b"return") - len(tail)
+    if pad < 0:
+        raise PatchError("no byte budget for `claudev` — binary layout changed")
+    return b"return" + b" " * pad + tail
+
+
+def build_reverted(m: re.Match[bytes]) -> bytes:
+    tail = (
+        b"`cd ${" + m["path"] + b"} ${" + m["sep"] + b"} claude --resume ${"
+        + m["call"] + b"}`"
+    )
+    pad = len(m[0]) - len(b"return") - len(tail)
+    if pad < 0:
+        raise PatchError("no byte budget to revert — binary layout changed")
+    return b"return" + b" " * pad + tail
+
+
+def rewrite(path: str, offset: int, payload: bytes) -> None:
+    """Copy → splice → atomic rename; never write into a running executable."""
+    directory = os.path.dirname(path)
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".claude.exe.patch-")
+    os.close(fd)
+    try:
+        shutil.copyfile(path, tmp)
+        with open(tmp, "r+b") as fh:
+            fh.seek(offset)
+            fh.write(payload)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def write_stamp(path: str, status: Status) -> None:
+    """Record size + whole-second mtime — the exact fields `stat -c '%s\t%Y'` yields."""
+    os.makedirs(os.path.dirname(STAMP), exist_ok=True)
+    st = os.stat(path)
+    with open(STAMP, "w") as fh:
+        fh.write(f"{path}\t{st.st_size}\t{int(st.st_mtime)}\t{status.value}\n")
+
+
+def run(path: str, *, check: bool, revert: bool) -> Status:
+    if read_head(path) != b"\x7fELF":
+        raise PatchError(f"{path} is not an ELF binary")
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        patched = find_one(data, PATCHED)
+        plain = None if patched else find_one(data, PLAIN)
+        if plain is None and patched is None:
+            raise PatchError("resume-command literal not found — claude version unsupported")
+        if check:
+            return Status.ALREADY if patched else Status.NOT_PATCHED
+        if revert:
+            if patched is None:
+                return Status.NOT_PATCHED
+            target, payload = patched.start(), build_reverted(patched)
+            result = Status.REVERTED
+        else:
+            if plain is None:
+                return Status.ALREADY
+            target, payload = plain.start(), build_patched(plain)
+            result = Status.PATCHED
+    rewrite(path, target, payload)
+    return result
+
+
+def main(argv: list[str]) -> int:
+    check = "--check" in argv
+    revert = "--revert" in argv
+    rest = [a for a in argv if not a.startswith("--")]
+    try:
+        path = resolve_binary(rest[0] if rest else None)
+    except PatchError as exc:
+        print(f"claudev-patch-resume: {exc}", file=sys.stderr)
+        return 1
+    try:
+        status = run(path, check=check, revert=revert)
+    except PatchError as exc:
+        print(f"claudev-patch-resume: {exc}", file=sys.stderr)
+        # Stamp the failure so claudev stops rescanning a 275 MB binary each launch.
+        try:
+            write_stamp(path, Status.NO_MATCH)
+        except OSError:
+            pass
+        return 1
+    except OSError as exc:
+        print(f"claudev-patch-resume: {path}: {exc}", file=sys.stderr)
+        return 1
+    if not check:
+        write_stamp(path, status)
+    print(f"{status.value}: {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Open the session picker in a floating kitty window (SUPER+C).
+exec kitty --class claudev-pick --title "claudev · сессии" \
+  "$HOME/.local/bin/claudev-pick" "$@"

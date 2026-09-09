@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Attach a kitty viewer on workspace 3 to every tmux-held claudev session and
+# merge them into one Hyprland tabbed group.
+#
+# Hyprland's exec-once fires ~10s before claudev-headless.service (which waits
+# on network-online), so this script must not assume the holders already exist:
+# it waits for the service, then creates any missing holder itself. Racing the
+# service is safe without a lock — tmux new-session is atomic, and a lock would
+# be worse: the locked fd leaks into the tmux server and is never released.
+set -u
+
+CLASS=claudev-session
+WS=3
+STATE="$HOME/.local/state/claudev"
+REG="$STATE/sessions"
+LEGACY=claudev
+HOLDER_WAIT=${CLAUDEV_HOLDER_WAIT:-75}
+
+mkdir -p "$STATE" "$REG"
+# Hyprland does not capture exec-once stderr anywhere, so keep our own log.
+RESTORE_LOG="$STATE/restore.log"
+log() {
+  printf '%s claudev-restore: %s\n' "$(date '+%F %T')" "$*" | tee -a "$RESTORE_LOG" >&2
+}
+log "запуск (pid $$, holders_wait=${CLAUDEV_HOLDER_WAIT:-75}с)"
+
+command -v hyprctl >/dev/null || { log "нет hyprctl — нечего делать"; exit 0; }
+[[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || { log "Hyprland не запущен"; exit 0; }
+
+registry_sids() { /bin/ls -1 "$REG" 2>/dev/null; }
+holders() { tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^cv-' | sort; }
+attached() { tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null \
+             | awk '$2>0{print $1}'; }
+
+spawn_holder() {
+  local sid="$1" name="cv-${1:0:8}" cwd mode att
+  tmux has-session -t "=$name" 2>/dev/null && return 0
+  # A session already running outside tmux (a terminal the user opened by hand)
+  # would be refused by claudev's duplicate guard, leaving a window that dies
+  # on sight. Leave it alone instead.
+  if pgrep -f -- "--(resume|session-id)[= ]$sid" >/dev/null 2>&1; then
+    log "$sid уже запущен вне tmux — холдер не поднимаю"
+    return 0
+  fi
+  cwd="$(sed -n 1p "$REG/$sid" 2>/dev/null)"
+  mode="$(sed -n 2p "$REG/$sid" 2>/dev/null)"
+  [[ -d "$cwd" ]] || cwd="$HOME"
+  [[ "$mode" == "claude" ]] && att=--attach-plain || att=--attach
+  # No lock needed: new-session is atomic, so a racing claudev-headless.sh
+  # either wins or gets "duplicate session" — never a second claude on one sid.
+  local err
+  if ! err="$(tmux new-session -d -s "$name" -c "$cwd" \
+                bash -lc "exec '$HOME/.local/bin/claudev' $att '$sid'" 2>&1)"; then
+    [[ "$err" == *"duplicate session"* ]] && return 0
+    log "не поднялся холдер $name: $err"
+    return 1
+  fi
+  tmux set-option -t "$name" status off
+  tmux set-option -t "$name" destroy-unattached off
+  tmux set-option -t "$name" @claudev_sid "$sid"
+  tmux set-option -t "$name" @claudev_cwd "$cwd"
+  log "поднят холдер $name (сервис не успел)"
+}
+
+# Give claudev-headless.service its chance first — it starts after the network
+# is up, which claude needs for auth. Only step in once it is done or too slow.
+await_holders() {
+  local want deadline state
+  want="$(registry_sids | wc -l)"
+  (( want )) || return 0
+  # Nothing to wait for if the unit is absent or switched off.
+  systemctl is-enabled claudev-headless.service >/dev/null 2>&1 || return 0
+
+  deadline=$(( SECONDS + HOLDER_WAIT ))
+  while (( SECONDS < deadline )); do
+    [[ "$(holders | wc -l)" -ge "$want" ]] && return 0
+    # "inactive" means the oneshot has not run yet — keep waiting. Only a
+    # finished (active, RemainAfterExit) or broken unit releases us early.
+    state="$(systemctl is-active claudev-headless.service 2>/dev/null)"
+    [[ "$state" == "active" || "$state" == "failed" ]] && return 0
+    sleep 1
+  done
+  log "сервис не поднял холдеры за ${HOLDER_WAIT}с — поднимаю сам"
+}
+
+# Legacy layout kept every session in windows of one shared tmux session; a
+# shared session mirrors its active window across clients, so split it apart.
+# Moving windows keeps the running claude processes alive.
+adopt_legacy() {
+  tmux has-session -t "=$LEGACY" 2>/dev/null || return 0
+  local win pane sid name
+  while read -r win; do
+    [[ -n "$win" ]] || continue
+    pane="$(tmux list-panes -t "$LEGACY:$win" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    sid="$(pgrep -P "${pane:-0}" -a 2>/dev/null \
+           | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}' | head -1)"
+    [[ -n "$sid" ]] || continue
+    name="cv-${sid:0:8}"
+    tmux has-session -t "=$name" 2>/dev/null && continue
+    tmux new-session -d -s "$name" -c "$HOME" 2>/dev/null || continue
+    if tmux move-window -s "$LEGACY:$win" -t "$name:" 2>/dev/null; then
+      tmux kill-window -t "$name:0" 2>/dev/null
+      tmux set-option -t "$name" status off
+      tmux set-option -t "$name" destroy-unattached off
+      log "перенесена $LEGACY:$win -> $name"
+    else
+      tmux kill-session -t "=$name" 2>/dev/null
+    fi
+  done < <(tmux list-windows -t "$LEGACY" -F '#{window_name}' 2>/dev/null | grep -v '^ctl$')
+  [[ "$(tmux list-windows -t "$LEGACY" 2>/dev/null | wc -l)" -le 1 ]] &&
+    tmux kill-session -t "=$LEGACY" 2>/dev/null
+  return 0
+}
+
+await_holders
+adopt_legacy
+while read -r sid; do
+  [[ -n "$sid" ]] && spawn_holder "$sid"
+done < <(registry_sids)
+
+mapfile -t names < <(holders)
+(( ${#names[@]} )) || { log "холдеров нет и реестр пуст — нечего восстанавливать"; exit 0; }
+
+viewers() { hyprctl -j clients | jq -r --arg c "$CLASS" '.[]|select(.class==$c)|.address'; }
+
+hyprctl dispatch workspace "$WS" >/dev/null
+
+# The group lives on the first window; each later one is focused onto it so
+# Hyprland's auto_group absorbs it.
+anchor="$(hyprctl -j clients | jq -r --arg c "$CLASS" '[.[]|select(.class==$c)][0].address // empty')"
+mapfile -t busy < <(attached)
+opened=0 skipped=0
+
+for name in "${names[@]}"; do
+  # A second client on one tmux session mirrors the same view — skip those.
+  if printf '%s\n' "${busy[@]}" | grep -qFx "$name"; then
+    log "$name уже открыт"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  cwd="$(tmux show-option -qv -t "$name" @claudev_cwd)"
+  [[ -d "$cwd" ]] || cwd="$HOME"
+
+  [[ -n "$anchor" ]] && hyprctl dispatch focuswindow "address:$anchor" >/dev/null
+
+  before="$(viewers | sort)"
+  # Long Claude sessions blow past the global 2000-line scrollback.
+  hyprctl dispatch exec "[workspace $WS] kitty --class $CLASS --title '[$name]' --directory '$cwd' --override scrollback_lines=50000 --override confirm_os_window_close=0 tmux attach-session -t '=$name'" >/dev/null
+
+  new=""
+  for _ in $(seq 1 150); do   # cold kitty start takes seconds
+    sleep 0.1
+    new="$(comm -13 <(printf '%s\n' "$before") <(viewers | sort) | head -1)"
+    [[ -n "$new" ]] && break
+  done
+  if [[ -z "$new" ]]; then
+    log "окно для $name не появилось"
+    continue
+  fi
+  opened=$((opened + 1))
+
+  if [[ -z "$anchor" ]]; then
+    anchor="$new"
+    hyprctl dispatch focuswindow "address:$anchor" >/dev/null
+    hyprctl dispatch togglegroup >/dev/null
+  fi
+done
+
+date -Is > "$STATE/last-restore"
+log "открыто $opened, пропущено $skipped, холдеров ${#names[@]}"
+hyprctl -j clients | jq --arg c "$CLASS" \
+  '[.[]|select(.class==$c)]|{"окон": length, "вгруппе": ([.[]|select((.grouped|length)>0)]|length)}'

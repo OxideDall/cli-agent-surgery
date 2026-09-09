@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Mirrors Claude transcripts to a remote host and freezes a dated snapshot.
+#
+# /home is ext4 with no snapshots, and Claude Code's retention sweep deletes
+# transcripts in place — the remote dated snapshots are the only thing that can
+# bring a deleted session back. Snapshots are hardlink copies, so a day costs
+# only what changed.
+set -euo pipefail
+
+# Hosts are tried in order — put a private/VPN address first, public as fallback.
+: "${CLAUDEV_BACKUP_HOSTS:?space-separated host list, e.g. "vpn.internal vps.example.com"}"
+SSH_PORT="${CLAUDEV_BACKUP_PORT:-22}"
+SSH_USER="${CLAUDEV_BACKUP_USER:-$USER}"
+REMOTE_ROOT="${CLAUDEV_BACKUP_ROOT:-/srv/backups/claudev}"
+KEEP_DAILY=30
+KEEP_MONTHLY=24
+
+STATE="$HOME/.local/state/claudev"
+LOG="$STATE/backup.log"
+mkdir -p "$STATE"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
+
+pick_host() {
+  local host
+  for host in $CLAUDEV_BACKUP_HOSTS; do
+    if timeout 8 ssh -p "$SSH_PORT" -o ConnectTimeout=6 -o BatchMode=yes \
+         "$SSH_USER@$host" true 2>/dev/null; then
+      printf '%s' "$host"
+      return 0
+    fi
+  done
+  return 1
+}
+
+HOST="$(pick_host)" || { log "ОШИБКА: ни один хост из CLAUDEV_BACKUP_HOSTS не отвечает"; exit 1; }
+log "цель: $HOST"
+
+RSH="ssh -p $SSH_PORT -o BatchMode=yes -o ConnectTimeout=10"
+STAMP="$(date +%F)"
+
+ssh -p "$SSH_PORT" -o BatchMode=yes "$SSH_USER@$HOST" \
+  "mkdir -p '$REMOTE_ROOT/current' '$REMOTE_ROOT/snapshots'"
+
+# --delete keeps the mirror faithful; anything it drops still lives in the
+# dated snapshots taken before this run.
+rsync -a --delete --partial --human-readable \
+  --exclude='*.tmp' \
+  -e "$RSH" \
+  "$HOME/.claude/projects/" \
+  "$SSH_USER@$HOST:$REMOTE_ROOT/current/projects/"
+
+rsync -a --partial -e "$RSH" \
+  "$HOME/.claude/history.jsonl" \
+  "$HOME/.claude/settings.json" \
+  "$SSH_USER@$HOST:$REMOTE_ROOT/current/"
+
+rsync -a --delete --partial -e "$RSH" \
+  "$STATE/" \
+  --exclude='index-cache.json' --exclude='backup.log' \
+  "$SSH_USER@$HOST:$REMOTE_ROOT/current/claudev-state/"
+
+# Hardlink snapshot + retention, run remotely so it costs one round trip.
+ssh -p "$SSH_PORT" -o BatchMode=yes "$SSH_USER@$HOST" bash -s <<REMOTE
+set -euo pipefail
+cd "$REMOTE_ROOT"
+if [[ ! -d "snapshots/$STAMP" ]]; then
+  cp -al current "snapshots/$STAMP"
+fi
+# Keep the last $KEEP_DAILY days, plus the first snapshot of each month.
+mapfile -t all < <(ls -1 snapshots | sort)
+declare -A keep=()
+for s in "\${all[@]: -$KEEP_DAILY}"; do keep[\$s]=1; done
+declare -A seen=()
+for s in "\${all[@]}"; do
+  m="\${s:0:7}"
+  if [[ -z "\${seen[\$m]:-}" ]]; then keep[\$s]=1; seen[\$m]=1; fi
+done
+monthly=(\$(printf '%s\n' "\${!seen[@]}" | sort | tail -$KEEP_MONTHLY))
+for s in "\${all[@]}"; do
+  [[ -n "\${keep[\$s]:-}" ]] || rm -rf "snapshots/\$s"
+done
+du -sh current snapshots 2>/dev/null
+ls -1 snapshots | wc -l | xargs echo "снапшотов:"
+REMOTE
+
+date -Is > "$STATE/last-backup"
+log "готово: снапшот $STAMP на $HOST"
